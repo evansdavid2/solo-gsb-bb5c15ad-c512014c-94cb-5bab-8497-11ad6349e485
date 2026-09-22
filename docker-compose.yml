@@ -1,0 +1,13 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /app/data/digest.db
+    volumes:
+      - digest-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  digest-data:
