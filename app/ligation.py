@@ -54,8 +54,16 @@ def _fragment_ends(record_position: int, digest_id: int, fragments) -> list[dict
     return ends
 
 
-def _match(end_a: dict, end_b: dict, include_blunt: bool):
-    """判定两个末端是否可连接，返回 ``(兼容类型, 连接后突出端)`` 或 None。"""
+def match_ends(end_a: dict, end_b: dict, include_blunt: bool):
+    """判定两个末端是否可连接，返回 ``(兼容类型, 连接后突出端)`` 或 None。
+
+    末端字典至少含 ``end_type`` / ``overhang``（与片段末端结构一致）。
+    本函数是末端配对枚举（:func:`find_compatible_pairs`）与片段拼接链
+    规划（``app.assembly``）共用的唯一兼容判定入口，两处口径完全一致：
+    黏端要求一方 5' 突出端序列等于另一方 3' 突出端序列的反向互补，
+    平端仅在 ``include_blunt`` 为真时与平端兼容。判定对入参对称
+    （``match_ends(a, b)`` 与 ``match_ends(b, a)`` 结论一致）。
+    """
     type_a = end_a["end_type"]
     type_b = end_b["end_type"]
     if type_a == BLUNT and type_b == BLUNT:
@@ -93,7 +101,7 @@ def find_compatible_pairs(records, include_blunt: bool) -> list[dict]:
             # 只枚举跨记录组合；i < j 保证同一末端不会与自身配对
             if end_b["record_position"] == end_a["record_position"]:
                 continue
-            match = _match(end_a, end_b, include_blunt)
+            match = match_ends(end_a, end_b, include_blunt)
             if match is None:
                 continue
             compatibility, ligated_overhang = match

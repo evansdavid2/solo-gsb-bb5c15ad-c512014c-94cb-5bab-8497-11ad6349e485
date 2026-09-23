@@ -72,6 +72,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/digests/{id}/methylation-analysis` | 只读分析甲基化对已保存酶切位点的阻断影响：按酶的敏感偏移定位甲基化碱基，阻断/保留/移除切口并重建片段（不落库，记录不存在返回 404） |
 | `POST` | `/gel-comparisons` | 只读比较 2~8 条已保存记录的凝胶条带：汇总片段长度按降序聚类（条带内 `(max-min)/max <= resolution_ratio`），返回条带长度范围、各泳道片段数、总碱基数与诊断条带（不落库，记录不存在返回 404） |
 | `POST` | `/ligation-compatibility` | 只读枚举 2~8 条已保存记录之间可连接的片段末端对：黏端要求一方 5' 突出端序列等于另一方 3' 突出端序列的反向互补，平端仅与平端兼容（可通过 `include_blunt` 关闭），返回按记录/片段/端方向稳定排序的配对、兼容类型、连接后突出端与总数（不落库，记录不存在返回 404） |
+| `POST` | `/ligation-assembly` | 只读规划 2~8 条已保存记录之间的最长片段拼接链：复用末端反向互补兼容判定构建有向图，搜索不重复使用记录的最长线性链（每条记录最多贡献一个片段，可正向/反向摆入，`max_chain_length` 限制链上节点数），同长度方案按记录请求顺序、片段索引与端方向稳定择优，返回节点端点、连接类型/突出端、总连接数与未能延伸的原因（不落库，记录不存在返回 404，候选片段过多返回 422） |
 | `GET` | `/health` | 健康检查 |
 
 ### 提交示例
@@ -615,6 +616,131 @@ curl -X POST http://localhost:8000/ligation-compatibility \
 | `digest_ids` 重复 / 少于 2 条 / 多于 8 条 | **422** |
 | `digest_ids` 含非整数、`include_blunt` 为非法布尔值 | **422** |
 
+## 片段拼接链规划
+
+只读规划 **2~8 条已保存记录**之间的最长线性片段拼接链（assembly chain）：
+每条记录从其完整酶切结果中**至多贡献一个片段**参与拼接（一条记录在链中
+最多出现一次）；片段是无方向元件，可以按原始方向（`forward`，`left→right`）
+或翻转方向（`reverse`，`right→left`）摆入链中。服务把"记录 × 片段 ×
+摆放方向"展开为**有向图节点**，节点间按 [末端连接兼容规则](#兼容规则)
+连边（仅跨记录连边），在图上搜索**节点数最多的简单路径**。**规划过程不写库**：
+原记录保持不变，也不会产生新的提交。
+
+### 请求
+
+```bash
+curl -X POST http://localhost:8000/ligation-assembly \
+  -H 'Content-Type: application/json' \
+  -d '{"digest_ids": [1, 2, 3], "include_blunt": true, "max_chain_length": 8}'
+```
+
+- `digest_ids`：2~8 个已保存记录 id，不可重复；**记录的请求顺序参与同长度
+  方案的稳定择优**（见下）。
+- `include_blunt`：**可选**，默认 `true`；为 `false` 时平端不能作为连接末端，
+  只允许黏端连接。
+- `max_chain_length`：**必填**，拼接链允许包含的最大节点（片段）数，整数闭区间
+  **`[2, 8]`**。每条记录最多贡献一个片段，因此链不可能长于记录数。
+
+### 最长链与稳定择优
+
+- 先最大化**节点数**（等价于最大化连接数 = 节点数 - 1）；
+- 节点数相同的方案，按节点序列逐键比较
+  **（记录请求位置 → 片段索引 → 链左端所用原片段端方向 `left < right`）**，
+  取字典序最小者。因此：优先使用请求顺序靠前的记录；同一记录优先使用片段索引
+  更小的片段；正向/翻转均可行时优先"链左端取自原片段左端"的摆放；
+- 比较结果与内部枚举顺序无关，**相同请求（含 digest_ids 顺序）结果必然一致**；
+  调换 `digest_ids` 顺序，选出的链也会相应改变。
+- 搜索为带剪枝的记忆化全枚举（状态 = 当前出端 × 未用记录集合 × 剩余链长槽位），
+  规模有界：全部记录的片段总数**超过 64 个**时返回 422。
+
+### 响应
+
+以下示例为三条记录：`id=1` 单切口产生 5' 突出端 `AAGT`（f0 右端）；`id=2`
+含两个切口，中间片段 f1 左端为 5' `AAGT`、右端为 3' `ACTT`，可作桥接；
+`id=3` 单切口产生 3' 突出端 `ACTT`（与 5' `AAGT` 反向互补）：
+
+```json
+{
+  "digest_ids": [1, 2, 3],
+  "include_blunt": true,
+  "max_chain_length": 8,
+  "record_count": 3,
+  "node_count": 3,
+  "connection_count": 2,
+  "nodes": [
+    {"digest_id": 1, "fragment_index": 0, "orientation": "forward",
+     "left_end":  {"digest_id": 1, "fragment_index": 0, "end": "left",
+                   "end_type": "none", "overhang": ""},
+     "right_end": {"digest_id": 1, "fragment_index": 0, "end": "right",
+                   "end_type": "5prime", "overhang": "AAGT"}},
+    {"digest_id": 2, "fragment_index": 1, "orientation": "reverse",
+     "left_end":  {"digest_id": 2, "fragment_index": 1, "end": "right",
+                   "end_type": "3prime", "overhang": "ACTT"},
+     "right_end": {"digest_id": 2, "fragment_index": 1, "end": "left",
+                   "end_type": "5prime", "overhang": "AAGT"}},
+    {"digest_id": 3, "fragment_index": 0, "orientation": "reverse",
+     "left_end":  {"digest_id": 3, "fragment_index": 0, "end": "right",
+                   "end_type": "3prime", "overhang": "ACTT"},
+     "right_end": {"digest_id": 3, "fragment_index": 0, "end": "left",
+                   "end_type": "none", "overhang": ""}}
+  ],
+  "connections": [
+    {"index": 0,
+     "from_end": {"digest_id": 1, "fragment_index": 0, "end": "right",
+                  "end_type": "5prime", "overhang": "AAGT"},
+     "to_end":   {"digest_id": 2, "fragment_index": 1, "end": "right",
+                  "end_type": "3prime", "overhang": "ACTT"},
+     "compatibility": "sticky", "ligated_overhang": "AAGT"},
+    {"index": 1,
+     "from_end": {"digest_id": 2, "fragment_index": 1, "end": "left",
+                  "end_type": "5prime", "overhang": "AAGT"},
+     "to_end":   {"digest_id": 3, "fragment_index": 0, "end": "right",
+                  "end_type": "3prime", "overhang": "ACTT"},
+     "compatibility": "sticky", "ligated_overhang": "AAGT"}
+  ],
+  "used_digest_ids": [1, 2, 3],
+  "unused_digest_ids": [],
+  "stop_reason": "all_records_used",
+  "stop_reason_detail": "every submitted record is used in the chain; ..."
+}
+```
+
+- `nodes[]`：链上节点，沿链从左到右排列：
+  - `fragment_index` 与 `GET /digests/{id}` 结果中的片段索引一致；
+  - `orientation` 为 `forward`（按原片段 left→right 摆入）或 `reverse`
+    （翻转摆入）；
+  - `left_end` / `right_end` 为该节点在**拼接链上**的左/右端点，其中 `end`
+    标明该端取自**原片段**的 `left` 还是 `right`（翻转时二者相反）；天然末端
+    `none` 只可能出现在整条链的两个最外端。
+- `connections[]`：相邻节点间的连接，`index` 从 0 起；`from_end` 恒为左侧
+  节点的出端、`to_end` 恒为右侧节点的入端，二者来自不同记录；
+  `compatibility` / `ligated_overhang` 的含义与 `/ligation-compatibility`
+  完全一致（黏端取接头处退火的 5' 突出端；平端为空字符串）。
+- `used_digest_ids` / `unused_digest_ids`：入选 / 未入选链的记录 id，均按
+  请求顺序排列。
+
+### 未能延伸的原因（`stop_reason`）
+
+| 值 | 含义 |
+| --- | --- |
+| `all_records_used` | 提交的全部记录都已在链中，没有剩余记录可继续延伸 |
+| `max_chain_length_reached` | 链已达到 `max_chain_length`，且链右端与某条**未用**记录的候选末端仍兼容——继续延伸被上限禁止 |
+| `no_compatible_extension` | 仍有未用记录，但链右端与其中任何候选末端都不兼容 |
+| `no_compatible_ends` | 全部记录之间不存在任何一对兼容末端，无法形成含至少一处连接的链；此时 `nodes` / `connections` 为空 |
+
+环形记录单切口开环产生的全长片段两端均为真实切割末端，两个方向都可参与
+拼接；无切口记录（两端为 `none`）不会产生候选节点，永远不会入选。
+
+### 校验与状态码
+
+| 情形 | 状态码 |
+| --- | --- |
+| 任一记录不存在（按请求顺序报告第一个缺失 id） | **404** |
+| `digest_ids` 重复 / 少于 2 条 / 多于 8 条 | **422** |
+| 缺少 `max_chain_length`，或其不在 `[2, 8]` / 非整数 | **422** |
+| `digest_ids` 含非整数、`include_blunt` 为非法布尔值 | **422** |
+| 全部记录的候选片段总数超过 64（枚举上限） | **422** |
+
 ## 行为规则
 
 - **双向搜索**：同时在 top 链搜索 `pattern` 与 `reverse_complement(pattern)`
@@ -641,6 +767,7 @@ app/
 ├── methylation.py   # 甲基化阻断分析（敏感位点定位、切口保留/移除、片段重建）
 ├── gel.py       # 凝胶条带比较（片段长度降序聚类、诊断条带标记）
 ├── ligation.py  # 末端连接兼容性分析（跨记录末端对枚举、黏端/平端兼容判定）
+├── assembly.py  # 片段拼接链规划（有向图、不重复用记录的最长简单路径与稳定择优）
 ├── iupac.py     # IUPAC 编码表与反向互补
 ├── schemas.py   # 请求/响应模型与校验
 └── db.py        # SQLite 持久化（启动时自动建表）
@@ -652,7 +779,8 @@ tests/
 ├── test_distribution_api.py  # 部分酶切概率分布 API 测试
 ├── test_methylation_api.py   # 甲基化阻断分析 API 测试
 ├── test_gel_api.py       # 凝胶条带比较 API 测试
-└── test_ligation_api.py  # 末端连接兼容性 API 测试
+├── test_ligation_api.py  # 末端连接兼容性 API 测试
+└── test_assembly_api.py  # 片段拼接链规划 API 测试
 Dockerfile
 docker-compose.yml
 requirements.txt

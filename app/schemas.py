@@ -542,3 +542,117 @@ class LigationCompatibilityResponse(BaseModel):
     pair_count: int
     pairs: list[LigationPairOut]
 
+
+# ---------- 片段拼接链规划 ----------
+
+
+class LigationAssemblyRequest(BaseModel):
+    """片段拼接链规划请求：2~8 条已保存记录 + 平端开关 + 最长链长。
+
+    digest_ids 不可重复（重复即 422）；include_blunt 默认为 True，为 false
+    时平端不能作为连接末端；max_chain_length 为拼接链允许包含的最大节点
+    （片段）数，闭区间 [2, 8]。记录是否存在依赖数据库，在路由中逐个确认，
+    任一不存在 -> 404；参与规划的片段总数过多（超过固定枚举上限）-> 422。
+    """
+
+    digest_ids: list[int] = Field(min_length=2, max_length=8, examples=[[1, 2]])
+    include_blunt: bool = Field(
+        default=True,
+        description="是否允许平端连接；false 时只允许黏端连接",
+        examples=[True],
+    )
+    max_chain_length: int = Field(
+        ge=2,
+        le=8,
+        description="拼接链允许包含的最大节点（片段）数；每条记录最多贡献一个片段",
+        examples=[8],
+    )
+
+    @model_validator(mode="after")
+    def _no_duplicate_ids(self) -> "LigationAssemblyRequest":
+        seen: set[int] = set()
+        duplicates: set[int] = set()
+        for digest_id in self.digest_ids:
+            if digest_id in seen:
+                duplicates.add(digest_id)
+            seen.add(digest_id)
+        if duplicates:
+            raise ValueError(
+                "duplicate digest ids: "
+                + ", ".join(str(i) for i in sorted(duplicates))
+            )
+        return self
+
+
+class AssemblyEndOut(BaseModel):
+    """拼接链中一个片段端点：记录 id、片段索引、端方向与该端类型/突出端。
+
+    end 为该端在**原片段**上的方向（``left`` / ``right``）；片段翻转摆入
+    链中时，其链左端可能对应原片段的 right 端。天然末端 ``none`` 只可能
+    出现在整条拼接链的最左/最右端（链内连接恒为兼容的切割末端）。
+    """
+
+    digest_id: int
+    fragment_index: int
+    end: Literal["left", "right"]
+    end_type: Literal["blunt", "5prime", "3prime", "none"]
+    overhang: str
+
+
+class AssemblyNodeOut(BaseModel):
+    """拼接链上的一个节点：一条已保存记录贡献的一个片段及其摆放方向。
+
+    orientation 为 ``forward``（按原片段 left→right 摆入）或 ``reverse``
+    （翻转摆入）；left_end / right_end 为该节点在拼接链上的左/右端点。
+    """
+
+    digest_id: int
+    fragment_index: int
+    orientation: Literal["forward", "reverse"]
+    left_end: AssemblyEndOut
+    right_end: AssemblyEndOut
+
+
+class AssemblyConnectionOut(BaseModel):
+    """拼接链中相邻两节点间的一处连接。
+
+    from_end 恒为左侧节点的出端（链右端），to_end 恒为右侧节点的入端
+    （链左端），二者来自不同记录且通过末端兼容判定；compatibility 为
+    ``sticky``（黏端）或 ``blunt``（平端），ligated_overhang 为接头处
+    退火的 5' 突出端序列，平端连接时为空字符串。
+    """
+
+    index: int
+    from_end: AssemblyEndOut
+    to_end: AssemblyEndOut
+    compatibility: Literal["sticky", "blunt"]
+    ligated_overhang: str
+
+
+class LigationAssemblyResponse(BaseModel):
+    """拼接链规划结果：节点数最多的线性链；同长按（记录请求顺序、片段索引、
+    端方向）稳定择优。
+
+    所有提交记录均不存在任何可连接末端时 nodes / connections 为空，
+    stop_reason 为 ``no_compatible_ends``。used / unused_digest_ids 分别为
+    入选 / 未入选链的记录 id，均按请求顺序排列。
+    """
+
+    digest_ids: list[int]
+    include_blunt: bool
+    max_chain_length: int
+    record_count: int
+    node_count: int
+    connection_count: int
+    nodes: list[AssemblyNodeOut]
+    connections: list[AssemblyConnectionOut]
+    used_digest_ids: list[int]
+    unused_digest_ids: list[int]
+    stop_reason: Literal[
+        "no_compatible_ends",
+        "all_records_used",
+        "max_chain_length_reached",
+        "no_compatible_extension",
+    ]
+    stop_reason_detail: str
+

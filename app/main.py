@@ -19,6 +19,14 @@
                                            序列的反向互补，平端仅与平端兼容（include_blunt
                                            可关闭），返回稳定排序的配对、兼容类型、
                                            连接后突出端与总数（不落库）
+    POST /ligation-assembly              只读规划 2~8 条已保存记录间的最长片段拼接链：
+                                           复用末端反向互补兼容判定构建有向图，搜索不重复
+                                           使用记录的最长线性链（每条记录最多贡献一个
+                                           片段，可正向/反向摆入），同长度方案按请求顺序、
+                                           片段索引与端方向稳定择优；include_blunt 可关闭
+                                           平端连接，max_chain_length 限制链上节点数；
+                                           返回节点端点、连接类型/突出端、总连接数与
+                                           未能延伸的原因（不落库）
     GET  /health                           健康检查
 """
 
@@ -31,6 +39,7 @@ from fastapi import FastAPI, HTTPException
 
 from .db import Database
 from .digest import run_digest
+from .assembly import MAX_ASSEMBLY_FRAGMENTS, plan_assembly_chain, public_node
 from .distribution import MAX_PARTIAL_CUTS, partial_digest_distribution
 from .gel import compare_gel_lanes
 from .ligation import find_compatible_pairs
@@ -45,6 +54,8 @@ from .schemas import (
     EnzymePanelPlanResponse,
     GelComparisonRequest,
     GelComparisonResponse,
+    LigationAssemblyRequest,
+    LigationAssemblyResponse,
     LigationCompatibilityRequest,
     LigationCompatibilityResponse,
     MethylationAnalysisRequest,
@@ -390,4 +401,59 @@ def ligation_compatibility(request: LigationCompatibilityRequest) -> dict:
         "record_count": len(records),
         "pair_count": len(pairs),
         "pairs": pairs,
+    }
+
+
+@app.post("/ligation-assembly", response_model=LigationAssemblyResponse)
+def ligation_assembly(request: LigationAssemblyRequest) -> dict:
+    # 逐条确认记录存在：任一不存在即 404，按请求顺序报告第一个缺失 id
+    records = []
+    for digest_id in request.digest_ids:
+        record = db.get_submission(digest_id)
+        if record is None:
+            raise HTTPException(
+                status_code=404, detail=f"submission {digest_id} not found"
+            )
+        records.append(
+            {"digest_id": digest_id, "fragments": record["result"]["fragments"]}
+        )
+
+    # 记忆化全枚举的状态空间随片段数与记录数膨胀：超过固定上限 -> 422
+    total_fragments = sum(len(r["fragments"]) for r in records)
+    if total_fragments > MAX_ASSEMBLY_FRAGMENTS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{total_fragments} candidate fragments across "
+                f"{len(records)} records exceed the assembly planning limit of "
+                f"{MAX_ASSEMBLY_FRAGMENTS}"
+            ),
+        )
+
+    # 仅在内存中构建有向图并搜索最长拼接链，数据库不做任何写入
+    plan = plan_assembly_chain(
+        records, request.include_blunt, request.max_chain_length
+    )
+    used_positions = plan["used_positions"]
+    return {
+        "digest_ids": list(request.digest_ids),
+        "include_blunt": request.include_blunt,
+        "max_chain_length": request.max_chain_length,
+        "record_count": len(records),
+        "node_count": len(plan["nodes"]),
+        "connection_count": len(plan["connections"]),
+        "nodes": [public_node(node) for node in plan["nodes"]],
+        "connections": plan["connections"],
+        "used_digest_ids": [
+            digest_id
+            for position, digest_id in enumerate(request.digest_ids)
+            if position in used_positions
+        ],
+        "unused_digest_ids": [
+            digest_id
+            for position, digest_id in enumerate(request.digest_ids)
+            if position not in used_positions
+        ],
+        "stop_reason": plan["stop_reason"],
+        "stop_reason_detail": plan["stop_reason_detail"],
     }
