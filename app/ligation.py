@@ -19,6 +19,8 @@
   再按下标 i < j 枚举配对：每对的 first 恒为全序中靠前的一端（必然
   属于请求顺序靠前的记录），返回顺序即该全序，相同请求的结果必然一致；
 * 整个分析只在内存中进行，不读写数据库。
+
+兼容判定 ``match_ends`` 同时被片段拼接链规划（assembly）复用。
 """
 
 from __future__ import annotations
@@ -54,8 +56,12 @@ def _fragment_ends(record_position: int, digest_id: int, fragments) -> list[dict
     return ends
 
 
-def _match(end_a: dict, end_b: dict, include_blunt: bool):
-    """判定两个末端是否可连接，返回 ``(兼容类型, 连接后突出端)`` 或 None。"""
+def match_ends(end_a: dict, end_b: dict, include_blunt: bool):
+    """判定两个末端是否可连接，返回 ``(兼容类型, 连接后突出端)`` 或 None。
+
+    判定只读取末端的 ``end_type`` 与 ``overhang``，且关于两个参数对称
+    （交换顺序结果相同）；拼接链规划复用本函数作为唯一兼容口径。
+    """
     type_a = end_a["end_type"]
     type_b = end_b["end_type"]
     if type_a == BLUNT and type_b == BLUNT:
@@ -93,7 +99,7 @@ def find_compatible_pairs(records, include_blunt: bool) -> list[dict]:
             # 只枚举跨记录组合；i < j 保证同一末端不会与自身配对
             if end_b["record_position"] == end_a["record_position"]:
                 continue
-            match = _match(end_a, end_b, include_blunt)
+            match = match_ends(end_a, end_b, include_blunt)
             if match is None:
                 continue
             compatibility, ligated_overhang = match

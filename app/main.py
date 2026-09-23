@@ -19,6 +19,11 @@
                                            序列的反向互补，平端仅与平端兼容（include_blunt
                                            可关闭），返回稳定排序的配对、兼容类型、
                                            连接后突出端与总数（不落库）
+    POST /assembly-chains                只读规划 2~8 条已保存记录的片段拼接链：复用末端
+                                           反向互补兼容判定构建有向图，搜索不重复使用记录的
+                                           最长线性拼接链，同长度按记录请求顺序、片段索引与
+                                           端方向稳定择优，返回节点端点、连接类型/突出端、
+                                           总连接数与未能延伸的原因（不落库）
     GET  /health                           健康检查
 """
 
@@ -30,6 +35,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 
 from .db import Database
+from .assembly import plan_assembly_chain
 from .digest import run_digest
 from .distribution import MAX_PARTIAL_CUTS, partial_digest_distribution
 from .gel import compare_gel_lanes
@@ -37,6 +43,8 @@ from .ligation import find_compatible_pairs
 from .methylation import analyze_methylation
 from .panel import plan_enzyme_panel
 from .schemas import (
+    AssemblyChainRequest,
+    AssemblyChainResponse,
     DigestRequest,
     DigestResponse,
     DigestSummary,
@@ -390,4 +398,31 @@ def ligation_compatibility(request: LigationCompatibilityRequest) -> dict:
         "record_count": len(records),
         "pair_count": len(pairs),
         "pairs": pairs,
+    }
+
+
+@app.post("/assembly-chains", response_model=AssemblyChainResponse)
+def plan_assembly(request: AssemblyChainRequest) -> dict:
+    # 逐条确认记录存在：任一不存在即 404，按请求顺序报告第一个缺失 id
+    records = []
+    for digest_id in request.digest_ids:
+        record = db.get_submission(digest_id)
+        if record is None:
+            raise HTTPException(
+                status_code=404, detail=f"submission {digest_id} not found"
+            )
+        records.append(
+            {"digest_id": digest_id, "fragments": record["result"]["fragments"]}
+        )
+
+    # 仅在内存中建图并搜索最长拼接链，数据库不做任何写入
+    plan = plan_assembly_chain(
+        records, request.include_blunt, request.max_chain_length
+    )
+    return {
+        "digest_ids": list(request.digest_ids),
+        "include_blunt": request.include_blunt,
+        "max_chain_length": request.max_chain_length,
+        "record_count": len(records),
+        **plan,
     }

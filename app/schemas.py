@@ -542,3 +542,83 @@ class LigationCompatibilityResponse(BaseModel):
     pair_count: int
     pairs: list[LigationPairOut]
 
+
+# ---------- 片段拼接链规划 ----------
+
+
+class AssemblyChainRequest(BaseModel):
+    """片段拼接链规划请求：2~8 条已保存记录 + 可选平端开关与最长链长。
+
+    digest_ids 不可重复（重复即 422）；include_blunt 默认为 True，
+    为 false 时平端-平端不参与连接；max_chain_length 为链的节点数
+    上限（>= 1，默认 8），超过记录数时等同于记录数。记录是否存在
+    依赖数据库，在路由中逐个确认，任一不存在 -> 404。
+    """
+
+    digest_ids: list[int] = Field(min_length=2, max_length=8, examples=[[1, 2, 3]])
+    include_blunt: bool = Field(
+        default=True,
+        description="是否允许平端-平端连接；false 时只使用黏端连接",
+        examples=[True],
+    )
+    max_chain_length: int = Field(
+        default=8,
+        ge=1,
+        description="链中节点（片段）数上限；超过记录数时等同于记录数",
+        examples=[8],
+    )
+
+    @model_validator(mode="after")
+    def _no_duplicate_ids(self) -> "AssemblyChainRequest":
+        seen: set[int] = set()
+        duplicates: set[int] = set()
+        for digest_id in self.digest_ids:
+            if digest_id in seen:
+                duplicates.add(digest_id)
+            seen.add(digest_id)
+        if duplicates:
+            raise ValueError(
+                "duplicate digest ids: "
+                + ", ".join(str(i) for i in sorted(duplicates))
+            )
+        return self
+
+
+class AssemblyNodeOut(BaseModel):
+    """链中一个节点：某条记录的一个片段及其左右端点。"""
+
+    digest_id: int
+    fragment_index: int
+    left_end: EndOut
+    right_end: EndOut
+
+
+class AssemblyJunctionOut(BaseModel):
+    """相邻节点之间的一处连接。
+
+    from_end / to_end 分别为链中靠前 / 靠后节点用于连接的末端；
+    compatibility 为 "sticky"（黏端）或 "blunt"（平端）；
+    ligated_overhang 为接头处退火的 5' 突出端序列，平端为空字符串。
+    """
+
+    from_end: LigationEndOut
+    to_end: LigationEndOut
+    compatibility: Literal["sticky", "blunt"]
+    ligated_overhang: str
+
+
+class AssemblyChainResponse(BaseModel):
+    """拼接链规划结果：最长链节点、连接、总连接数与未能延伸的原因。"""
+
+    digest_ids: list[int]
+    include_blunt: bool
+    max_chain_length: int
+    record_count: int
+    chain_length: int
+    junction_count: int
+    stop_reason: Literal[
+        "all_records_used", "max_chain_length_reached", "no_compatible_end"
+    ]
+    nodes: list[AssemblyNodeOut]
+    junctions: list[AssemblyJunctionOut]
+
